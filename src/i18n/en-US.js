@@ -156,6 +156,10 @@ export default {
     intervalSchedule: 'Interval',
     dailySchedule: 'Daily',
     dailyTimes: 'Times',
+    cutoffTime: 'Daily cutoff',
+    cutoffTimeDesc: 'Stop reminders at this time and restart the next day; leave empty for no limit',
+    cutoffTimeHint: 'Optional; resumes the next day',
+    clearCutoff: 'Clear cutoff time',
     allowSnooze: 'Allow snooze',
     lockDuration: 'Lock duration',
     clickToReset: 'Click to reset',
@@ -171,6 +175,7 @@ export default {
     noActiveTask: 'No Active Task',
     snoozed: 'Snoozed',
     disabled: 'Disabled',
+    cutoffReached: 'Done for today',
   },
 
   // Idle

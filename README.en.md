@@ -123,6 +123,7 @@ In today's fast-paced digital era, a healthy body is the cornerstone of high pro
 ### 3. Simple and Easy to Use
 - **Complete task system**: Use the built-in sitting, water, and eye-rest reminders or add any number of custom tasks that run independently.
 - **Interval and daily schedules**: Trigger tasks every few minutes or at multiple daily `HH:mm` times, such as 11:00 exercise and 21:00 foot bath.
+- **Daily cutoff time**: Set an optional daily cutoff (for example, 21:00) in the settings for water or other tasks. After the cutoff, pre-notifications, snoozed reminders, and merged reminders stop for the day; timers restart the next day. Leave the field empty or use the clear button to remove the limit.
 - **Fine-grained task controls**: Enable, pause, resume, and reset tasks individually while configuring interval, warning, snooze, rest duration, and idle-reset behavior.
 - **Quick bulk actions**: Pause, resume, or reset everything from the main window or tray, and reset a specific task directly from the tray submenu.
 - **Accurate background timing**: Timers run in the Rust backend rather than depending on UI refreshes, keeping reminders punctual while minimized or tray-resident.

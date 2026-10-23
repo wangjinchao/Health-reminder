@@ -9,6 +9,7 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { t, setLocale, getLocale, getSupportedLocales, detectLocale } from './i18n/index.js';
+import { normalizeCutoffTime, isTaskCutoffReached, canTaskRemind } from './task-schedule.js';
 
 const ICONS = {
   sit: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"></path><path d="M12 6v6l4 2"></path></svg>`,
@@ -1110,7 +1111,8 @@ async function syncTasksToBackend() {
     icon: task.icon,
     auto_reset_on_idle: settings.resetOnIdle, // 使用全局设置
     schedule_type: task.scheduleType || 'interval',
-    daily_times: Array.isArray(task.dailyTimes) ? task.dailyTimes : []
+    daily_times: Array.isArray(task.dailyTimes) ? task.dailyTimes : [],
+    cutoff_time: normalizeCutoffTime(task.cutoffTime)
   }));
   await invoke('sync_tasks', { tasks: tasksForBackend }).catch(console.error);
 }
@@ -1183,7 +1185,7 @@ function getNextTaskInfo() {
   let minTime = Infinity;
   settings.tasks.forEach(task => {
     const remaining = countdowns[task.id];
-    if (task.enabled && !taskPausedStatus[task.id] && remaining !== undefined && remaining < minTime) {
+    if (!taskPausedStatus[task.id] && remaining !== undefined && canTaskRemind(task, remaining) && remaining < minTime) {
       minTime = remaining;
       nextTask = task;
     }
@@ -1221,8 +1223,10 @@ function getFloatingTaskOptions() {
         ? ` (${t('status.paused')})`
         : !task.enabled
           ? ` (${t('status.disabled')})`
-          : '';
-      const time = remaining === undefined ? '' : ` ${formatDuration(remaining)}`;
+          : isTaskCutoffReached(task)
+            ? ` (${t('status.cutoffReached')})`
+            : '';
+      const time = remaining === undefined || isTaskCutoffReached(task) ? '' : ` ${formatDuration(remaining)}`;
       return { id: task.id, label: `${getTaskDisplayTitle(task)}${time}${state}` };
     })
   ];
@@ -1330,7 +1334,7 @@ function isReminderTaskVisible(taskId) {
 }
 
 function shouldRecoverZeroCountdownTrigger(info, task) {
-  if (!task || !info.enabled || info.task_paused || info.snoozed || isPaused || isIdle || lockScreenEnding) {
+  if (!task || !canTaskRemind(task) || info.cutoff_reached || !info.enabled || info.task_paused || info.snoozed || isPaused || isIdle || lockScreenEnding) {
     return false;
   }
   return Number(info.remaining) === 0 && !isReminderTaskVisible(task.id);
@@ -1471,6 +1475,7 @@ async function handleTriggeredTaskOnce(task) {
 
   // 找到完整的任务配置
   const fullTask = settings.tasks.find(t => t.id === task.id) || task;
+  if (!canTaskRemind(fullTask)) return true;
 
   try {
     if (activePopup || lockScreenState.active) {
@@ -1480,7 +1485,7 @@ async function handleTriggeredTaskOnce(task) {
         return true;
       }
       if (!taskQueue.find(t => t.id === fullTask.id)) {
-        taskQueue.push(fullTask);
+        taskQueue.push({ ...fullTask, queuedDate: new Date().toDateString() });
       }
     } else {
       await triggerNotification(fullTask);
@@ -1717,7 +1722,7 @@ async function init() {
       const task = settings.tasks.find(t => t.id === info.id);
       const preNotifyTime = (task && task.preNotificationSeconds !== undefined) ? task.preNotificationSeconds : 5;
       
-      if (info.enabled && !info.task_paused && !isIdle && !isPaused && preNotifyTime > 0 && info.remaining === preNotifyTime) {
+      if (info.enabled && !info.task_paused && !info.cutoff_reached && !isIdle && !isPaused && preNotifyTime > 0 && info.remaining === preNotifyTime && canTaskRemind(task, info.remaining)) {
         if (task) {
            if (settings.soundEnabled) {
              playReminderSound();
@@ -1946,6 +1951,7 @@ async function loadSettings() {
           snoozeMinutes: def ? def.snoozeMinutes : 5,
           scheduleType: 'interval',
           dailyTimes: [],
+          cutoffTime: '',
           ...task
         });
       });
@@ -1989,13 +1995,18 @@ function applyTheme(theme) {
 // tick 函数已移至 Rust 后端，不再需要前端定时器
 
 async function triggerNotification(task) {
+  if (!canTaskRemind(task)) return;
   await playReminderSound();
+  if (!canTaskRemind(task)) {
+    processNextTask();
+    return;
+  }
   
   // 计算合并的任务
   let mergedTasks = [task];
   if (settings.enableMerge) {
     settings.tasks.forEach(t => {
-      if (t.id !== task.id && t.enabled) {
+      if (t.id !== task.id && canTaskRemind(t)) {
         const remaining = countdowns[t.id];
         // 如果剩余时间小于阈值，且没有正在推迟（或者推迟了但也快到了，这里简单起见只看remaining）
         // 注意：countdowns可能会有延迟，但通常是准的
@@ -2030,6 +2041,11 @@ async function startLockScreen(task, mergedTasks = []) {
     pauseMediaPromise,
     new Promise(resolve => setTimeout(resolve, 800)),
   ]);
+  if (!canTaskRemind(task)) {
+    processNextTask();
+    return;
+  }
+  mergedTasks = mergedTasks.filter(item => canTaskRemind(item));
   try {
     invoke('timer_set_lock_screen_active', { active: true }).catch(console.error);
   } catch (e) {
@@ -2401,6 +2417,7 @@ function cancelUnlockPress(event) {
 }
 
 function processNextTask() {
+  taskQueue = taskQueue.filter(task => canTaskRemind(task));
   if (taskQueue.length > 0 && !activePopup && !lockScreenState.active) {
     const nextTask = taskQueue.shift();
     triggerNotification(nextTask);
@@ -2618,7 +2635,8 @@ function updateTrayTooltip(force = false) {
   } else {
     settings.tasks.forEach(t_task => {
       if (t_task.enabled) {
-        lines.push(`${getTaskDisplayTitle(t_task)}：${formatTime(countdowns[t_task.id] ?? 0)}`);
+        const status = isTaskCutoffReached(t_task) ? t('status.cutoffReached') : formatTime(countdowns[t_task.id] ?? 0);
+        lines.push(`${getTaskDisplayTitle(t_task)}：${status}`);
       }
     });
   }
@@ -2679,10 +2697,11 @@ function updateLiveValues() {
     const cardRefs = domCache.taskCards.get(task.id);
     if (!cardRefs) return;
 
-    let current = countdowns[task.id] || 0;
+    const cutoffReached = isTaskCutoffReached(task);
+    let current = cutoffReached ? 0 : countdowns[task.id] || 0;
     let total = getCountdownTotal(task);
     const snoozeState = snoozedStatus[task.id];
-    const isSnoozed = snoozeState && snoozeState.active;
+    const isSnoozed = !cutoffReached && snoozeState && snoozeState.active;
 
     if (isSnoozed) {
       total = (task.snoozeMinutes || 5) * 60;
@@ -2695,7 +2714,11 @@ function updateLiveValues() {
     }
 
     if (cardRefs.timeDisplay) {
-      if (isSnoozed) {
+      if (cutoffReached) {
+        cardRefs.card.classList.remove('snoozed');
+        cardRefs.timeDisplay.innerText = t('status.cutoffReached');
+        cardRefs.timeDisplay.style.color = 'var(--text-muted)';
+      } else if (isSnoozed) {
         cardRefs.card.classList.add('snoozed');
         cardRefs.timeDisplay.innerText = t('status.snoozed') + ' ' + formatTime(current);
         cardRefs.timeDisplay.style.color = 'var(--warning)';
@@ -2791,6 +2814,14 @@ function renderFullUI() {
             <div class="footer-option daily-times-option">
               <span>${t('taskCard.dailyTimes')}</span>
               <input type="text" class="daily-times-input" value="${(task.dailyTimes || []).join(', ')}" data-id="${task.id}" placeholder="11:00, 21:00">
+            </div>
+            <div class="footer-option cutoff-time-option" title="${t('taskCard.cutoffTimeDesc')}">
+              <label for="cutoff-${task.id}">${t('taskCard.cutoffTime')}</label>
+              <div class="cutoff-time-control">
+                <input type="time" id="cutoff-${task.id}" class="cutoff-time-input" value="${normalizeCutoffTime(task.cutoffTime)}" data-id="${task.id}">
+                <button type="button" class="cutoff-clear-btn" data-id="${task.id}" aria-label="${t('taskCard.clearCutoff')}" title="${t('taskCard.clearCutoff')}">×</button>
+              </div>
+              <span>${t('taskCard.cutoffTimeHint')}</span>
             </div>
             <div class="footer-option">
               <span>${t('taskCard.preNotify')}</span>
@@ -3234,6 +3265,7 @@ function getFloatingStatusText(task) {
   if (isIdle) return t('status.idle');
   if (task && !task.enabled) return t('status.disabled');
   if (task && taskPausedStatus[task.id]) return t('status.paused');
+  if (task && isTaskCutoffReached(task)) return t('status.cutoffReached');
   if (task && snoozedStatus[task.id]?.active) return t('status.snoozed');
   return t('floating.nextReminder');
 }
@@ -3515,7 +3547,7 @@ function updateFloatingUI() {
     pauseBtn.disabled = !task || !task.enabled;
   }
   titleEl.textContent = task ? getTaskDisplayTitle(task) : t('status.noActiveTask');
-  timeEl.textContent = task ? formatDuration(remaining) : '--:--';
+  timeEl.textContent = task && !isTaskCutoffReached(task) ? formatDuration(remaining) : '--:--';
   metaEl.textContent = getFloatingMetaText(task);
 }
 
@@ -3645,6 +3677,24 @@ function bindEvents() {
       e.target.value = dailyTimes.join(', ');
       updateTask(id, { dailyTimes, scheduleType: dailyTimes.length > 0 ? 'daily' : 'interval' });
       renderFullUI();
+    });
+  });
+
+  document.querySelectorAll('.cutoff-time-input').forEach(el => {
+    el.addEventListener('change', () => {
+      const cutoffTime = normalizeCutoffTime(el.value);
+      el.value = cutoffTime;
+      updateTask(el.dataset.id, { cutoffTime });
+      updateLiveValues();
+    });
+  });
+
+  document.querySelectorAll('.cutoff-clear-btn').forEach(el => {
+    el.addEventListener('click', () => {
+      const input = document.getElementById(`cutoff-${el.dataset.id}`);
+      if (input) input.value = '';
+      updateTask(el.dataset.id, { cutoffTime: '' });
+      updateLiveValues();
     });
   });
 

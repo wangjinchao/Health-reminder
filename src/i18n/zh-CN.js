@@ -156,6 +156,10 @@ export default {
     intervalSchedule: '间隔',
     dailySchedule: '定点',
     dailyTimes: '时间点',
+    cutoffTime: '每日截止时间',
+    cutoffTimeDesc: '到点后停止当天提醒，次日重新计时；留空不限制',
+    cutoffTimeHint: '留空不限制，次日自动恢复',
+    clearCutoff: '取消截止时间',
     allowSnooze: '允许推迟',
     lockDuration: '锁屏时长',
     clickToReset: '点击重置',
@@ -171,6 +175,7 @@ export default {
     noActiveTask: '无活动任务',
     snoozed: '推迟中',
     disabled: '已停用',
+    cutoffReached: '今日已截止',
   },
 
   // 空闲

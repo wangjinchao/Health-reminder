@@ -248,6 +248,8 @@ pub struct TaskConfig {
     pub schedule_type: String,
     #[serde(default)]
     pub daily_times: Vec<String>,
+    #[serde(default)]
+    pub cutoff_time: String,
 }
 
 #[derive(Clone, Debug)]
@@ -262,6 +264,7 @@ struct TaskTimer {
     frozen_remaining: Option<u64>,
     frozen_total: Option<u64>,
     reset_during_lock: bool,
+    cutoff_day: chrono::NaiveDate,
 }
 
 struct TimerState {
@@ -334,12 +337,67 @@ fn parse_daily_time(value: &str) -> Option<(u32, u32)> {
     Some((hour, minute))
 }
 
-fn current_daily_trigger_key(task: &TaskConfig) -> Option<String> {
-    if !is_daily_task(task) {
+fn task_cutoff_seconds(task: &TaskConfig) -> Option<u32> {
+    parse_daily_time(&task.cutoff_time).map(|(hour, minute)| hour * 3600 + minute * 60)
+}
+
+fn task_cutoff_reached(task: &TaskConfig, time: chrono::NaiveTime) -> bool {
+    task_cutoff_seconds(task).is_some_and(|cutoff| time.num_seconds_from_midnight() >= cutoff)
+}
+
+fn refresh_cutoff_timers(state: &mut TimerState, now: Instant, local_now: chrono::NaiveDateTime) {
+    let globally_frozen =
+        state.paused || state.system_locked || state.lock_screen_active || state.is_idle;
+    let mut cancelled_ids = HashSet::new();
+
+    for timer in state.tasks.values_mut() {
+        if task_cutoff_seconds(&timer.config).is_none() {
+            continue;
+        }
+
+        let new_day = timer.cutoff_day != local_now.date();
+        if new_day {
+            timer.triggered = false;
+            timer.snoozed = false;
+            timer.snooze_count = 0;
+            cancelled_ids.insert(timer.config.id.clone());
+        }
+
+        // 暂停补偿结束后再跨日重置，避免把暂停时长重复加到新一轮计时。
+        if !globally_frozen && new_day {
+            timer.cutoff_day = local_now.date();
+            timer.reset_time = now;
+            timer.triggered = false;
+            timer.snoozed = false;
+            timer.snooze_count = 0;
+            timer.daily_last_trigger_key = None;
+            timer.reset_during_lock = false;
+            clear_timer_freeze(timer);
+            if timer.disabled_at.is_some() {
+                timer.disabled_at = Some(now);
+                freeze_timer_countdown(timer, now);
+            }
+            cancelled_ids.insert(timer.config.id.clone());
+        }
+
+        if task_cutoff_reached(&timer.config, local_now.time()) {
+            timer.triggered = false;
+            timer.snoozed = false;
+            timer.snooze_count = 0;
+            cancelled_ids.insert(timer.config.id.clone());
+        }
+    }
+
+    state
+        .pending_triggers
+        .retain(|pending| !cancelled_ids.contains(&pending.id));
+}
+
+fn current_daily_trigger_key(task: &TaskConfig, now: chrono::NaiveDateTime) -> Option<String> {
+    if !is_daily_task(task) || task_cutoff_reached(task, now.time()) {
         return None;
     }
 
-    let now = Local::now();
     for value in &task.daily_times {
         if let Some((hour, minute)) = parse_daily_time(value) {
             if now.hour() == hour && now.minute() == minute {
@@ -356,13 +414,20 @@ fn current_daily_trigger_key(task: &TaskConfig) -> Option<String> {
 }
 
 fn daily_remaining_seconds(task: &TaskConfig) -> u64 {
-    let now = Local::now();
+    daily_remaining_seconds_at(task, Local::now().naive_local())
+}
+
+fn daily_remaining_seconds_at(task: &TaskConfig, now: chrono::NaiveDateTime) -> u64 {
     let now_secs = now.hour() * 3600 + now.minute() * 60 + now.second();
+    let cutoff = task_cutoff_seconds(task);
     let mut best: Option<u32> = None;
 
     for value in &task.daily_times {
         if let Some((hour, minute)) = parse_daily_time(value) {
             let target_secs = hour * 3600 + minute * 60;
+            if cutoff.is_some_and(|cutoff| target_secs >= cutoff) {
+                continue;
+            }
             let remaining = if target_secs >= now_secs {
                 target_secs - now_secs
             } else {
@@ -372,7 +437,13 @@ fn daily_remaining_seconds(task: &TaskConfig) -> u64 {
         }
     }
 
-    best.unwrap_or(task.interval.saturating_mul(60) as u32) as u64
+    best.map(u64::from).unwrap_or_else(|| {
+        if cutoff.is_some() {
+            24 * 3600
+        } else {
+            task.interval.saturating_mul(60)
+        }
+    })
 }
 
 fn calculate_timer_countdown(
@@ -469,6 +540,7 @@ mod tests {
                 auto_reset_on_idle: true,
                 schedule_type: "interval".to_string(),
                 daily_times: Vec::new(),
+                cutoff_time: String::new(),
             },
             reset_time,
             triggered: false,
@@ -479,7 +551,200 @@ mod tests {
             frozen_remaining: None,
             frozen_total: None,
             reset_during_lock: false,
+            cutoff_day: Local::now().date_naive(),
         }
+    }
+
+    fn local_at(day: u32, hour: u32, minute: u32, second: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, day)
+            .unwrap()
+            .and_hms_opt(hour, minute, second)
+            .unwrap()
+    }
+
+    fn cutoff_timer(now: Instant) -> TaskTimer {
+        let mut timer = interval_timer(60, now - Duration::from_secs(120));
+        timer.config.id = "water".to_string();
+        timer.config.cutoff_time = "21:00".to_string();
+        timer.cutoff_day = local_at(23, 0, 0, 0).date();
+        timer
+    }
+
+    #[test]
+    fn old_task_config_defaults_to_no_cutoff() {
+        let timer = interval_timer(60, Instant::now());
+        let mut value = serde_json::to_value(&timer.config).unwrap();
+        value.as_object_mut().unwrap().remove("cutoff_time");
+        let task: TaskConfig = serde_json::from_value(value).unwrap();
+
+        assert!(task.cutoff_time.is_empty());
+        assert!(!task_cutoff_reached(&task, local_at(23, 23, 59, 59).time()));
+    }
+
+    #[test]
+    fn cutoff_is_exclusive_at_the_exact_local_minute() {
+        let mut timer = cutoff_timer(Instant::now());
+        assert!(!task_cutoff_reached(
+            &timer.config,
+            local_at(23, 20, 59, 59).time()
+        ));
+        assert!(task_cutoff_reached(
+            &timer.config,
+            local_at(23, 21, 0, 0).time()
+        ));
+        assert!(task_cutoff_reached(
+            &timer.config,
+            local_at(23, 23, 59, 59).time()
+        ));
+        assert!(!task_cutoff_reached(
+            &timer.config,
+            local_at(24, 0, 0, 0).time()
+        ));
+
+        for cutoff in ["", "invalid", "24:00", "21:60"] {
+            timer.config.cutoff_time = cutoff.to_string();
+            assert!(!task_cutoff_reached(
+                &timer.config,
+                local_at(23, 23, 59, 59).time()
+            ));
+        }
+        timer.config.cutoff_time = "00:00".to_string();
+        assert!(task_cutoff_reached(
+            &timer.config,
+            local_at(23, 0, 0, 0).time()
+        ));
+    }
+
+    #[test]
+    fn cutoff_cancels_snoozed_and_pending_reminders_without_affecting_other_tasks() {
+        let now = Instant::now();
+        let mut timer = cutoff_timer(now);
+        timer.snoozed = true;
+        timer.snooze_count = 2;
+        timer.triggered = true;
+        timer.reset_time = now + Duration::from_secs(60);
+        let mut state = TimerState::new();
+        state.tasks.insert("water".to_string(), timer);
+        state
+            .tasks
+            .insert("sit".to_string(), interval_timer(45, now));
+        for id in ["water", "sit"] {
+            enqueue_pending_trigger(
+                &mut state,
+                &TaskTriggeredPayload {
+                    id: id.to_string(),
+                    title: id.to_string(),
+                    desc: String::new(),
+                    icon: String::new(),
+                },
+            );
+        }
+
+        refresh_cutoff_timers(&mut state, now, local_at(23, 21, 0, 0));
+
+        let water = &state.tasks["water"];
+        assert!(!water.triggered);
+        assert!(!water.snoozed);
+        assert_eq!(water.snooze_count, 0);
+        assert_eq!(state.pending_triggers.len(), 1);
+        assert_eq!(state.pending_triggers[0].id, "sit");
+        assert_eq!(state.tasks["sit"].reset_time, now);
+    }
+
+    #[test]
+    fn next_day_restarts_a_full_interval_without_replaying_missed_reminders() {
+        let now = Instant::now();
+        let mut timer = cutoff_timer(now);
+        timer.triggered = true;
+        timer.snoozed = true;
+        timer.snooze_count = 1;
+        let mut state = TimerState::new();
+        state.tasks.insert("water".to_string(), timer);
+
+        refresh_cutoff_timers(&mut state, now, local_at(24, 8, 0, 0));
+
+        let water = &state.tasks["water"];
+        assert_eq!(water.cutoff_day, local_at(24, 0, 0, 0).date());
+        assert_eq!(calculate_timer_countdown(water, now, true).0, 3600);
+        assert!(!water.triggered);
+        assert!(!water.snoozed);
+        refresh_cutoff_timers(
+            &mut state,
+            now + Duration::from_secs(30),
+            local_at(24, 8, 0, 30),
+        );
+        assert_eq!(
+            calculate_timer_countdown(&state.tasks["water"], now + Duration::from_secs(30), true).0,
+            3570
+        );
+    }
+
+    #[test]
+    fn next_day_restart_preserves_individual_pause() {
+        let now = Instant::now();
+        let mut timer = cutoff_timer(now);
+        timer.disabled_at = Some(now - Duration::from_secs(60));
+        let mut state = TimerState::new();
+        state.tasks.insert("water".to_string(), timer);
+
+        refresh_cutoff_timers(&mut state, now, local_at(24, 8, 0, 0));
+
+        let water = &state.tasks["water"];
+        assert_eq!(water.disabled_at, Some(now));
+        assert_eq!(water.frozen_remaining, Some(3600));
+    }
+
+    #[test]
+    fn next_day_restart_waits_for_global_pause_lock_or_idle_to_end() {
+        let now = Instant::now();
+        for frozen_kind in 0..4 {
+            let mut state = TimerState::new();
+            state.tasks.insert("water".to_string(), cutoff_timer(now));
+            state.paused = frozen_kind == 0;
+            state.system_locked = frozen_kind == 1;
+            state.lock_screen_active = frozen_kind == 2;
+            state.is_idle = frozen_kind == 3;
+            refresh_cutoff_timers(&mut state, now, local_at(24, 8, 0, 0));
+            assert_eq!(
+                state.tasks["water"].cutoff_day,
+                local_at(23, 0, 0, 0).date()
+            );
+
+            state.paused = false;
+            state.system_locked = false;
+            state.lock_screen_active = false;
+            state.is_idle = false;
+            let resumed = now + Duration::from_secs(300);
+            refresh_cutoff_timers(&mut state, resumed, local_at(24, 8, 5, 0));
+            assert_eq!(
+                calculate_timer_countdown(&state.tasks["water"], resumed, true).0,
+                3600
+            );
+        }
+    }
+
+    #[test]
+    fn daily_schedule_ignores_times_at_and_after_cutoff() {
+        let mut timer = cutoff_timer(Instant::now());
+        timer.config.schedule_type = "daily".to_string();
+        timer.config.daily_times = vec![
+            "20:00".to_string(),
+            "21:00".to_string(),
+            "22:00".to_string(),
+        ];
+        assert!(current_daily_trigger_key(&timer.config, local_at(23, 20, 0, 0)).is_some());
+        assert!(current_daily_trigger_key(&timer.config, local_at(23, 21, 0, 0)).is_none());
+        assert!(current_daily_trigger_key(&timer.config, local_at(23, 22, 0, 0)).is_none());
+        assert_eq!(
+            daily_remaining_seconds_at(&timer.config, local_at(23, 20, 30, 0)),
+            23 * 3600 + 30 * 60
+        );
+
+        timer.config.daily_times = vec!["21:00".to_string(), "22:00".to_string()];
+        assert_eq!(
+            daily_remaining_seconds_at(&timer.config, local_at(23, 20, 30, 0)),
+            24 * 3600
+        );
     }
 
     #[test]
@@ -689,6 +954,7 @@ struct CountdownInfo {
     total: u64,     // 总秒数
     enabled: bool,
     task_paused: bool,
+    cutoff_reached: bool,
     snoozed: bool,         // 是否推迟中
     snooze_remaining: u64, // 推迟剩余时间
     snooze_count: u32,     // 当前已推迟次数
@@ -821,7 +1087,8 @@ fn sync_tasks(app: tauri::AppHandle, tasks: Vec<TaskConfig>) {
                 // 任务已存在
                 let interval_changed = existing.config.interval != task.interval
                     || existing.config.schedule_type != task.schedule_type
-                    || existing.config.daily_times != task.daily_times;
+                    || existing.config.daily_times != task.daily_times
+                    || existing.config.cutoff_time != task.cutoff_time;
                 let was_disabled = !existing.config.enabled;
                 let is_now_enabled = task.enabled;
                 let was_enabled = existing.config.enabled;
@@ -841,6 +1108,7 @@ fn sync_tasks(app: tauri::AppHandle, tasks: Vec<TaskConfig>) {
                         frozen_remaining: None,
                         frozen_total: None,
                         reset_during_lock: false,
+                        cutoff_day: Local::now().date_naive(),
                     };
                     if should_freeze_new_state {
                         freeze_timer_countdown(&mut new_timer, now);
@@ -865,6 +1133,7 @@ fn sync_tasks(app: tauri::AppHandle, tasks: Vec<TaskConfig>) {
                         frozen_remaining: None,
                         frozen_total: None,
                         reset_during_lock: existing.reset_during_lock,
+                        cutoff_day: existing.cutoff_day,
                     };
                     if should_freeze_new_state {
                         freeze_timer_countdown(&mut new_timer, now);
@@ -884,6 +1153,7 @@ fn sync_tasks(app: tauri::AppHandle, tasks: Vec<TaskConfig>) {
                         frozen_remaining: existing.frozen_remaining,
                         frozen_total: existing.frozen_total,
                         reset_during_lock: existing.reset_during_lock,
+                        cutoff_day: existing.cutoff_day,
                     };
                     freeze_timer_countdown(&mut new_timer, now);
                     new_tasks.insert(task_id, new_timer);
@@ -902,6 +1172,7 @@ fn sync_tasks(app: tauri::AppHandle, tasks: Vec<TaskConfig>) {
                             frozen_remaining: existing.frozen_remaining,
                             frozen_total: existing.frozen_total,
                             reset_during_lock: existing.reset_during_lock,
+                            cutoff_day: existing.cutoff_day,
                         },
                     );
                 }
@@ -919,6 +1190,7 @@ fn sync_tasks(app: tauri::AppHandle, tasks: Vec<TaskConfig>) {
                     frozen_remaining: None,
                     frozen_total: None,
                     reset_during_lock: false,
+                    cutoff_day: Local::now().date_naive(),
                 };
                 if should_freeze_new_state {
                     freeze_timer_countdown(&mut new_timer, now);
@@ -928,10 +1200,11 @@ fn sync_tasks(app: tauri::AppHandle, tasks: Vec<TaskConfig>) {
         }
 
         state.tasks = new_tasks;
+        refresh_cutoff_timers(&mut state, now, Local::now().naive_local());
         let active_task_ids: HashSet<String> = state
             .tasks
             .iter()
-            .filter(|(_, timer)| timer.config.enabled)
+            .filter(|(_, timer)| timer.config.enabled && timer.triggered)
             .map(|(id, _)| id.clone())
             .collect();
         state
@@ -1094,8 +1367,10 @@ fn timer_snooze_task(task_id: String, minutes: u64) {
 
 #[tauri::command]
 fn get_countdowns() -> Vec<CountdownInfo> {
-    let state = get_timer_state().lock().unwrap();
+    let mut state = get_timer_state().lock().unwrap();
     let now = Instant::now();
+    let local_now = Local::now().naive_local();
+    refresh_cutoff_timers(&mut state, now, local_now);
     let frozen_now = if state.paused || state.system_locked {
         state.pause_start.unwrap_or(now)
     } else if state.lock_screen_active {
@@ -1120,7 +1395,13 @@ fn get_countdowns() -> Vec<CountdownInfo> {
             };
 
             let timer_frozen = globally_frozen || timer.disabled_at.is_some();
-            let (remaining, total_secs, snooze_remaining) = if timer_frozen {
+            let cutoff_reached = task_cutoff_reached(&timer.config, local_now.time())
+                || (globally_frozen
+                    && task_cutoff_seconds(&timer.config).is_some()
+                    && timer.cutoff_day != local_now.date());
+            let (remaining, total_secs, snooze_remaining) = if cutoff_reached {
+                (0, timer.config.interval.saturating_mul(60), 0)
+            } else if timer_frozen {
                 if let (Some(remaining), Some(total)) = (timer.frozen_remaining, timer.frozen_total)
                 {
                     let snooze_remaining = if timer.snoozed {
@@ -1146,6 +1427,7 @@ fn get_countdowns() -> Vec<CountdownInfo> {
                 total: total_secs,
                 enabled: timer.config.enabled,
                 task_paused: timer.config.enabled && timer.disabled_at.is_some(),
+                cutoff_reached,
                 snoozed: timer.snoozed,
                 snooze_remaining,
                 snooze_count: timer.snooze_count,
@@ -1156,7 +1438,8 @@ fn get_countdowns() -> Vec<CountdownInfo> {
 
 #[tauri::command]
 fn peek_triggered_tasks() -> Vec<TaskTriggeredPayload> {
-    let state = get_timer_state().lock().unwrap();
+    let mut state = get_timer_state().lock().unwrap();
+    refresh_cutoff_timers(&mut state, Instant::now(), Local::now().naive_local());
     state.pending_triggers.clone()
 }
 
@@ -1921,13 +2204,15 @@ fn start_timer_thread(app_handle: AppHandle) {
 
             {
                 let mut state = get_timer_state().lock().unwrap();
+                let now = Instant::now();
+                let local_now = Local::now().naive_local();
+                refresh_cutoff_timers(&mut state, now, local_now);
 
                 // 如果暂停、系统锁屏或锁屏模式激活，跳过检查
                 if state.paused || state.system_locked || state.lock_screen_active {
                     continue;
                 }
 
-                let now = Instant::now();
                 let idle_seconds = get_idle_seconds();
                 let threshold = state.idle_threshold_seconds;
                 let was_idle = state.is_idle;
@@ -1986,6 +2271,8 @@ fn start_timer_thread(app_handle: AppHandle) {
                     idle_start_timestamp: state.idle_start_timestamp,
                 };
 
+                refresh_cutoff_timers(&mut state, now, local_now);
+
                 // 如果处于空闲状态，不检查任务触发（计时暂停）
                 if state.is_idle {
                     // 空闲时不触发任何任务，但仍然发送倒计时更新
@@ -1993,6 +2280,9 @@ fn start_timer_thread(app_handle: AppHandle) {
                     // 正常检查任务触发
                     for timer in state.tasks.values_mut() {
                         if !timer.config.enabled {
+                            continue;
+                        }
+                        if task_cutoff_reached(&timer.config, local_now.time()) {
                             continue;
                         }
                         if timer.disabled_at.is_some() {
@@ -2014,7 +2304,7 @@ fn start_timer_thread(app_handle: AppHandle) {
                         }
 
                         if is_daily_task(&timer.config) {
-                            if let Some(key) = current_daily_trigger_key(&timer.config) {
+                            if let Some(key) = current_daily_trigger_key(&timer.config, local_now) {
                                 if timer.daily_last_trigger_key.as_deref() != Some(&key) {
                                     tasks_to_trigger.push(TaskTriggeredPayload {
                                         id: timer.config.id.clone(),
